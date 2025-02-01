@@ -88,7 +88,7 @@ bench() {
   echo "🔗 Using DB_CONN_STRING=$DB_CONN_STRING"
 
   echo "🛠 Running benchmark tests..."
-  go test -bench . -benchtime=10s
+  go test -bench . -benchtime=10s -count=1 -run=^$ -v
 }
 
 # Run tests using the correct connection string
@@ -99,7 +99,7 @@ test() {
   echo "🔗 Using DB_CONN_STRING=$DB_CONN_STRING"
 
   echo "🛠 Running tests..."
-  go test .
+  go test -p 1 .
 }
 
 # Show usage if no command is provided

@@ -9,174 +9,187 @@ import (
 	"go.uber.org/zap"
 )
 
-// Conduktor manages sending and receiving messages
+// Conduktor manages sending and receiving messages through the appropriate store.
 type Conduktor struct {
-	mu          sync.Mutex
-	wire        Wire
-	store       Store
-	strandConfs map[string]StrandConf
-	strandMsgs  map[string][]Msg
+	mu       sync.Mutex
+	wire     Wire
+	volatile Store // Non-durable strands
+	durable  Store // Durable strands
 }
 
-// ConduktorMake initializes a new message queue
-func ConduktorMake(store Store, wire Wire) *Conduktor {
+// ConduktorMake initializes a new Conduktor with separate volatile and durable stores.
+func ConduktorMake(volatile Store, durable Store, wire Wire) *Conduktor {
 	return &Conduktor{
-		store:       store,
-		wire:        wire,
-		strandConfs: make(map[string]StrandConf),
-		strandMsgs:  make(map[string][]Msg),
+		wire:     wire,
+		volatile: volatile,
+		durable:  durable,
 	}
 }
 
-// ConfStrand allows configuration of individual channels
-func (mq *Conduktor) ConfStrand(channel string, config StrandConf) {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-	mq.strandConfs[channel] = config
+// StrandAdd registers a new strand and determines whether to store it in volatile or durable storage.
+func (c *Conduktor) StrandAdd(strandID string, config StrandConf) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	store := c.selectStore(config.Durable)
+	if err := store.CreateStrand(strandID, config); err != nil {
+		logger.Error("Failed to create strand", zap.String("strand", strandID), zap.Error(err))
+		return err
+	}
+
+	logger.Debug("Strand added",
+		zap.String("strand", strandID),
+		zap.Bool("durable", config.Durable),
+	)
+	return nil
 }
 
-// Send places a message in the queue and sends it via the configured transport
-func (mq *Conduktor) Send(channel string, payload string) error {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
+// Send places a message in the appropriate store and sends it via the configured transport.
+func (c *Conduktor) Send(strandID string, payload string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	config, exists := mq.strandConfs[channel]
-	if !exists {
-		return errors.New("channel not configured")
+	store, err := c.getStore(strandID)
+	if err != nil {
+		return err
 	}
 
 	msg := Msg{
 		ID:        fmt.Sprintf("%d", time.Now().UnixNano()),
-		Channel:   channel,
+		Strand:    strandID,
 		Payload:   payload,
 		Acked:     false,
 		Timestamp: time.Now().Unix(),
 	}
 
-	// Store the message if durability is enabled
-	if config.Durable {
-		if err := mq.store.Save(msg); err != nil {
-			return err
-		}
+	// Always save the message, regardless of durability
+	if err := store.Save(msg); err != nil {
+		return err
 	}
 
 	// Send via transport
-	if err := mq.wire.SendMessage(msg); err != nil {
-		logger.Error("Message send failed", zap.String("channel", channel), zap.Error(err))
+	if err := c.wire.SendMessage(msg); err != nil {
+		logger.Error("Message send failed", zap.String("strand", strandID), zap.Error(err))
 		return err
 	}
 
-	// Queue the message for tracking
-	mq.strandMsgs[channel] = append(mq.strandMsgs[channel], msg)
-	messagesSent.WithLabelValues(channel).Inc()
-	queueSize.WithLabelValues(channel).Set(float64(len(mq.strandMsgs[channel])))
-
+	messagesSent.WithLabelValues(strandID).Inc()
+	logger.Debug("Message sent", zap.String("strand", strandID), zap.String("payload", msg.Payload))
 	return nil
 }
 
-// Receive retrieves the next message from the queue via transport
-func (mq *Conduktor) Receive(channel string) *Msg {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
-
-	// Check if the channel is configured
-	if _, exists := mq.strandConfs[channel]; !exists {
-		logger.Warn("Channel not configured", zap.String("channel", channel))
-		return nil
-	}
+// Receive retrieves the next message from the queue via transport.
+func (c *Conduktor) Receive(strandID string) (*Msg, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	// Attempt to receive from the transport
-	msg, err := mq.wire.ReceiveMessage(channel)
+	msg, err := c.wire.ReceiveMessage(strandID)
 	if err != nil {
-		logger.Warn("No messages available", zap.String("channel", channel), zap.Error(err))
-		return nil
+		logger.Warn("No messages available", zap.String("strand", strandID), zap.Error(err))
+		return nil, err
 	}
 
-	// Track received messages
-	messagesReceived.WithLabelValues(channel).Inc()
-	logger.Debug("Message received",
-		zap.String("channel", channel),
-		zap.String("payload", msg.Payload),
-	)
-
-	return msg
+	messagesReceived.WithLabelValues(strandID).Inc()
+	logger.Debug("Message received", zap.String("strand", strandID), zap.String("payload", msg.Payload))
+	return msg, nil
 }
 
-// Acknowledge marks a message as processed
-func (mq *Conduktor) Acknowledge(channel, msgID string) error {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
+// Acknowledge marks a message as processed and removes it from storage.
+func (c *Conduktor) Acknowledge(strandID, msgID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	config, exists := mq.strandConfs[channel]
-	if !exists {
-		return errors.New("channel not configured")
-	}
-
-	// Mark message as acknowledged in durable storage
-	if err := mq.store.Acknowledge(channel, msgID); err != nil && config.Durable {
-		logger.Error("Acknowledgment failed", zap.String("channel", channel), zap.Error(err))
+	store, err := c.getStore(strandID)
+	if err != nil {
 		return err
 	}
 
-	// Remove acknowledged message from queue
-	for i, msg := range mq.strandMsgs[channel] {
-		if msg.ID == msgID {
-			mq.strandMsgs[channel] = append(mq.strandMsgs[channel][:i], mq.strandMsgs[channel][i+1:]...)
-			break
+	if err := store.Acknowledge(strandID, msgID); err != nil {
+		logger.Error("Acknowledgment failed", zap.String("strand", strandID), zap.String("msgID", msgID), zap.Error(err))
+		return err
+	}
+
+	logger.Debug("Message acknowledged", zap.String("strand", strandID), zap.String("msgID", msgID))
+	return nil
+}
+
+// StrandRemove deletes a strand and all of its messages.
+func (c *Conduktor) StrandRemove(strandID string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	store, err := c.getStore(strandID)
+	if err != nil {
+		return err
+	}
+
+	if err := store.DeleteStrand(strandID); err != nil {
+		logger.Error("Failed to delete strand", zap.String("strand", strandID), zap.Error(err))
+		return err
+	}
+
+	logger.Info("Strand deleted", zap.String("strand", strandID))
+	return nil
+}
+
+// selectStore determines which store to use based on strand durability.
+func (c *Conduktor) selectStore(durable bool) Store {
+	if durable {
+		return c.durable
+	}
+	return c.volatile
+}
+
+// getStore retrieves the store and configuration for a given strand.
+func (c *Conduktor) getStore(strandID string) (Store, error) {
+	// Check both stores for the strand configuration
+	for _, store := range []Store{c.durable, c.volatile} {
+		if store.HasStrand(strandID) {
+			return store, nil
 		}
 	}
 
-	queueSize.WithLabelValues(channel).Set(float64(len(mq.strandMsgs[channel])))
-
-	logger.Warn("Message acknowledged",
-		zap.String("channel", channel),
-		zap.String("msgID", msgID),
-	)
-
-	return nil
+	logger.Warn("Strand not found", zap.String("strand", strandID))
+	return nil, errors.New("strand not found")
 }
 
-// RecoverUnackedMessages reloads unacknowledged messages from storage and retries sending them.
-func (mq *Conduktor) RecoverUnackedMessages(channel string) error {
-	mq.mu.Lock()
-	defer mq.mu.Unlock()
+// RecoverUnackedMessages iterates through unacknowledged messages and resends them.
+func (c *Conduktor) RecoverUnackedMessages() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
-	config, exists := mq.strandConfs[channel]
-	if !exists {
-		logger.Warn("Channel not configured for recovery", zap.String("channel", channel))
-		return errors.New("channel not configured")
-	}
-
-	// Only recover messages if durability is enabled
-	if !config.Durable {
-		logger.Warn("Skipping recovery for non-durable channel", zap.String("channel", channel))
-		return nil
-	}
-
-	// Load unacknowledged messages from the store
-	unackedMessages, err := mq.store.LoadUnacked(channel)
+	// Retrieve an iterator for unacked messages
+	iterator, err := c.durable.UnackedIterator()
 	if err != nil {
-		logger.Error("Failed to load unacknowledged messages", zap.String("channel", channel), zap.Error(err))
+		logger.Error("Failed to get UnackedIterator", zap.Error(err))
 		return err
 	}
+	defer iterator.Close()
 
-	logger.Warn("Recovering unacknowledged messages",
-		zap.String("channel", channel),
-		zap.Int("count", len(unackedMessages)),
-	)
+	logger.Info("Starting recovery of unacked messages")
 
-	// Attempt to resend each unacknowledged message
-	for _, msg := range unackedMessages {
-		if err := mq.wire.SendMessage(msg); err != nil {
+	// Process messages one by one
+	for {
+		msg, hasNext := iterator.Next()
+		if !hasNext {
+			break
+		}
+
+		// Attempt to resend the message
+		if err := c.wire.SendMessage(*msg); err != nil {
 			logger.Error("Failed to resend unacked message",
-				zap.String("channel", channel),
 				zap.String("msgID", msg.ID),
 				zap.Error(err),
 			)
-			continue // Skip this message but continue with others
+			continue
 		}
-		mq.strandMsgs[channel] = append(mq.strandMsgs[channel], msg)
+
+		logger.Info("Successfully recovered message",
+			zap.String("msgID", msg.ID),
+		)
 	}
 
+	logger.Info("Completed recovery for strand")
 	return nil
 }

@@ -1,53 +1,80 @@
 package main
 
 import (
+	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 )
 
+// ConduktorTestFactory creates two Conduktors (sender & receiver) communicating over the same wire.
+func ConduktorTestFactory() (sender *Conduktor, receiver *Conduktor, reload func()) {
+	// Create separate stores for sender and receiver
+	os.RemoveAll("/tmp/badger_test_db_sender")
+	senderVolatileStore := RamStoreMake()
+	senderDurableStore, _ := BadgerStoreMake("/tmp/badger_test_db_sender")
+
+	os.RemoveAll("/tmp/badger_test_db_receiver")
+	receiverVolatileStore := RamStoreMake()
+	receiverDurableStore, _ := BadgerStoreMake("/tmp/badger_test_db_receiver")
+
+	// Create a shared wire for communication
+	wire := GoChanWireMake()
+
+	// Initialize sender and receiver Conduktors
+	sender = ConduktorMake(senderVolatileStore, senderDurableStore, wire)
+	receiver = ConduktorMake(receiverVolatileStore, receiverDurableStore, wire)
+
+	// Reload function to clear both stores
+	reload = func() {
+		wire.Reset()
+		senderVolatileStore.Reload()
+		senderDurableStore.Reload()
+		receiverVolatileStore.Reload()
+		receiverDurableStore.Reload()
+	}
+
+	return sender, receiver, reload
+}
+
 // Test Ordered Queue (FIFO)
 func TestOrderedQueue(t *testing.T) {
-	store := RamStoreMake()
-	wire := GoChanWireMake()
-	conduktor := ConduktorMake(store, wire)
+	sender, receiver, _ := ConduktorTestFactory()
 
-	conduktor.ConfStrand("ordered_channel", StrandConf{Durable: false, Ordered: true})
+	sender.StrandAdd("ordered_channel", StrandConf{Durable: false, Ordered: true})
 
 	// Send messages in order
-	conduktor.Send("ordered_channel", "Message 1")
-	conduktor.Send("ordered_channel", "Message 2")
-	conduktor.Send("ordered_channel", "Message 3")
+	sender.Send("ordered_channel", "Message 1")
+	sender.Send("ordered_channel", "Message 2")
+	sender.Send("ordered_channel", "Message 3")
 
 	// Ensure messages are received in order
-	msg1 := conduktor.Receive("ordered_channel")
+	msg1, _ := receiver.Receive("ordered_channel")
 	assert.NotNil(t, msg1)
 	assert.Equal(t, "Message 1", msg1.Payload)
 
-	msg2 := conduktor.Receive("ordered_channel")
+	msg2, _ := receiver.Receive("ordered_channel")
 	assert.NotNil(t, msg2)
 	assert.Equal(t, "Message 2", msg2.Payload)
 
-	msg3 := conduktor.Receive("ordered_channel")
+	msg3, _ := receiver.Receive("ordered_channel")
 	assert.NotNil(t, msg3)
 	assert.Equal(t, "Message 3", msg3.Payload)
 }
 
 // Test Unordered Queue (Should be Out of Order)
 func TestUnorderedQueue(t *testing.T) {
-	store := RamStoreMake()
-	wire := GoChanWireMake()
-	conduktor := ConduktorMake(store, wire)
+	sender, receiver, _ := ConduktorTestFactory()
 
-	conduktor.ConfStrand("unordered_channel", StrandConf{Durable: false, Ordered: false})
+	sender.StrandAdd("unordered_channel", StrandConf{Durable: false, Ordered: false})
 
-	conduktor.Send("unordered_channel", "A")
-	conduktor.Send("unordered_channel", "B")
-	conduktor.Send("unordered_channel", "C")
+	sender.Send("unordered_channel", "A")
+	sender.Send("unordered_channel", "B")
+	sender.Send("unordered_channel", "C")
 
 	msgs := map[string]bool{}
 	for i := 0; i < 3; i++ {
-		msg := conduktor.Receive("unordered_channel")
+		msg, _ := receiver.Receive("unordered_channel")
 		assert.NotNil(t, msg)
 		msgs[msg.Payload] = true
 	}
@@ -60,56 +87,42 @@ func TestUnorderedQueue(t *testing.T) {
 
 // Test Durable Queue (BadgerDB Persistence)
 func TestDurableQueue(t *testing.T) {
-	store, _ := BadgerStoreMake("/tmp/badger_test_db")
-	defer store.Close()
+	sender, receiver, reload := ConduktorTestFactory()
 
-	wire := GoChanWireMake()
-	conduktor1 := ConduktorMake(store, wire)
-	conduktor1.ConfStrand("durable_channel", StrandConf{Durable: true, Ordered: true})
+	sender.StrandAdd("durable_channel", StrandConf{Durable: true, Ordered: true})
 
-	conduktor1.Send("durable_channel", "Persistent 1")
-	conduktor1.Send("durable_channel", "Persistent 2")
+	sender.Send("durable_channel", "Persistent 1")
+	sender.Send("durable_channel", "Persistent 2")
 
-	// Simulate restart
-	wire2 := GoChanWireMake()
-	conduktor1 = ConduktorMake(store, wire2)
-	conduktor1.ConfStrand("durable_channel", StrandConf{Durable: true, Ordered: true})
-	conduktor1.RecoverUnackedMessages("durable_channel")
+	// Simulate restart by calling Reload
+	reload()
 
-	// Make receiver
-	store2 := RamStoreMake()
-	conduktor2 := ConduktorMake(store2, wire2)
-	conduktor2.ConfStrand("durable_channel", StrandConf{Durable: true, Ordered: true})
-	conduktor2.RecoverUnackedMessages("durable_channel")
+	// Recover unacked messages
+	sender.RecoverUnackedMessages()
+	receiver.RecoverUnackedMessages()
 
-	msg1 := conduktor2.Receive("durable_channel")
+	msg1, _ := receiver.Receive("durable_channel")
 	assert.NotNil(t, msg1)
 	assert.Equal(t, "Persistent 1", msg1.Payload)
 
-	msg2 := conduktor2.Receive("durable_channel")
+	msg2, _ := receiver.Receive("durable_channel")
 	assert.NotNil(t, msg2)
 	assert.Equal(t, "Persistent 2", msg2.Payload)
 }
 
 // Test Non-Durable Queue (Should Not Persist)
 func TestNonDurableQueue(t *testing.T) {
-	store, _ := BadgerStoreMake("/tmp/badger_test_db")
-	wire := GoChanWireMake()
+	sender, receiver, reset := ConduktorTestFactory()
+	defer reset()
 
-	conduktor1 := ConduktorMake(store, wire)
-	conduktor1.ConfStrand("non_durable_channel", StrandConf{Durable: false, Ordered: true})
+	sender.StrandAdd("non_durable_channel", StrandConf{Durable: false, Ordered: true})
 
-	conduktor1.Send("non_durable_channel", "Ephemeral 1")
-	conduktor1.Send("non_durable_channel", "Ephemeral 2")
+	sender.Send("non_durable_channel", "Ephemeral 1")
+	sender.Send("non_durable_channel", "Ephemeral 2")
 
-	// Simulate restart
-	wire2 := GoChanWireMake()
-	conduktor1 = ConduktorMake(store, wire2)
+	// Simulate restart by calling Reload
+	reset()
 
-	store2 := RamStoreMake()
-	conduktor2 := ConduktorMake(store2, wire2)
-	conduktor2.ConfStrand("non_durable_channel", StrandConf{Durable: false, Ordered: true})
-
-	msg1 := conduktor2.Receive("non_durable_channel")
+	msg1, _ := receiver.Receive("non_durable_channel")
 	assert.Nil(t, msg1)
 }

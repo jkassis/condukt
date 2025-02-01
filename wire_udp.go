@@ -57,7 +57,7 @@ func (s *UDPWire) ReceiveMessage(channel string) (*Msg, error) {
 	}
 
 	logger.Info("Message received via UDP",
-		zap.String("channel", msg.Channel),
+		zap.String("channel", msg.Strand),
 		zap.String("payload", msg.Payload),
 		zap.String("from", addr.String()),
 	)

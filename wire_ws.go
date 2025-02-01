@@ -34,9 +34,9 @@ func (s *WSWire) SendMessage(msg Msg) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	conn, exists := s.connections[msg.Channel]
+	conn, exists := s.connections[msg.Strand]
 	if !exists {
-		logger.Warn("No WebSocket connection for channel", zap.String("channel", msg.Channel))
+		logger.Warn("No WebSocket connection for channel", zap.String("channel", msg.Strand))
 		return errors.New("no active WebSocket connection for channel")
 	}
 
@@ -50,9 +50,9 @@ func (s *WSWire) SendMessage(msg Msg) error {
 		return err
 	}
 
-	messagesSent.WithLabelValues(msg.Channel).Inc()
+	messagesSent.WithLabelValues(msg.Strand).Inc()
 	logger.Info("Message sent via WebSocket",
-		zap.String("channel", msg.Channel),
+		zap.String("channel", msg.Strand),
 		zap.String("payload", msg.Payload),
 	)
 	return nil
@@ -73,7 +73,7 @@ func (s *WSWire) ReceiveMessage(channel string) (*Msg, error) {
 	messagesReceived.WithLabelValues(channel).Inc()
 
 	logger.Info("Message received via WebSocket",
-		zap.String("channel", msg.Channel),
+		zap.String("channel", msg.Strand),
 		zap.String("payload", msg.Payload),
 	)
 
@@ -114,7 +114,7 @@ func (s *WSWire) HandleWebSocketConnection(w http.ResponseWriter, r *http.Reques
 			}
 
 			s.mu.Lock()
-			if ch, exists := s.recvCh[msg.Channel]; exists {
+			if ch, exists := s.recvCh[msg.Strand]; exists {
 				ch <- msg
 			}
 			s.mu.Unlock()

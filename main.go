@@ -36,11 +36,12 @@ func main() {
 
 	// Choose storage (RAM or BadgerDB)
 	// store := NewRamMessageStore()
-	store, _ := BadgerStoreMake("/tmp/badgerdb")
+	vStore := RamStoreMake()
+	dStore, _ := BadgerStoreMake("/tmp/badgerdb")
 
 	// Initialize Message Queue
-	mq := ConduktorMake(store, sender)
-	mq.ConfStrand("test_channel", StrandConf{Durable: true, Ordered: true})
+	mq := ConduktorMake(vStore, dStore, sender)
+	mq.StrandAdd("test_channel", StrandConf{Durable: true, Ordered: true})
 
 	// Send and Receive Messages
 	mq.Send("test_channel", "Hello via WebSockets!")

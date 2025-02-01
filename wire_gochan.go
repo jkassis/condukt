@@ -25,20 +25,20 @@ func (s *GoChanWire) SendMessage(msg Msg) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.channels[msg.Channel]; !exists {
-		s.channels[msg.Channel] = make(chan Msg, 100) // Buffered channel
+	if _, exists := s.channels[msg.Strand]; !exists {
+		s.channels[msg.Strand] = make(chan Msg, 100000) // Buffered channel
 	}
 
 	select {
-	case s.channels[msg.Channel] <- msg:
-		messagesSent.WithLabelValues(msg.Channel).Inc()
+	case s.channels[msg.Strand] <- msg:
+		messagesSent.WithLabelValues(msg.Strand).Inc()
 		logger.Debug("Message sent via GoChanWire",
-			zap.String("channel", msg.Channel),
+			zap.String("channel", msg.Strand),
 			zap.String("payload", msg.Payload),
 		)
 		return nil
 	default:
-		logger.Warn("Channel buffer full", zap.String("channel", msg.Channel))
+		logger.Warn("Channel buffer full", zap.String("channel", msg.Strand))
 		return errors.New("channel buffer full")
 	}
 }
@@ -67,4 +67,21 @@ func (s *GoChanWire) ReceiveMessage(channel string) (*Msg, error) {
 	)
 
 	return &msg, nil
+}
+
+// Reset clears all channels, simulating a failure.
+func (s *GoChanWire) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Close all existing channels
+	for strand, ch := range s.channels {
+		close(ch)
+		delete(s.channels, strand)
+	}
+
+	// Reinitialize channels map
+	s.channels = make(map[string]chan Msg)
+
+	logger.Debug("GoChanWire reset: all channels cleared")
 }
